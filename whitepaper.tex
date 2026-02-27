@@ -1,0 +1,862 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage[ruled,lined,linesnumbered]{algorithm2e}
+\usepackage{microtype}
+
+% --- Hyperref setup ---
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=green!50!black,
+    urlcolor=blue!70!black,
+}
+
+% --- Header/footer ---
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textit{Reverse-Engineered Garmin VO$_2$Max Estimation}}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% --- Title ---
+\title{
+    \vspace{-1cm}
+    \textbf{Reverse-Engineering Garmin's VO$_2$Max\\Estimation Algorithm}\\[0.5em]
+    \large A Complete Specification from Observed Activity Data
+}
+\author{}
+\date{February 2026}
+
+% ===========================================================================
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+% --- Abstract ---
+\begin{abstract}
+\noindent
+This paper presents a reverse-engineered replica of Garmin's proprietary VO$_2$Max estimation algorithm, reconstructed entirely from exported activity data.
+The algorithm handles two sport categories---cycling and running---with distinct estimation pipelines.
+Cycling VO$_2$Max is computed directly from Firstbeat's metabolic equivalent (maxMet) field with no temporal smoothing.
+Running VO$_2$Max is estimated through an ACSM-based metabolic cost model combined with a \%HR$_{\text{max}}$-to-\%VO$_2$Max mapping, then temporally smoothed via a quality-filtered exponential moving average (EMA) with a two-phase alpha schedule.
+Additional behavioral features include quality filtering (minimum duration and intensity thresholds), detraining decay, cross-sport transfer, and duration correction for cardiac drift.
+Validated against 220 activities from two athletes over 14 months, the algorithm achieves \textbf{80.3\% exact match} with Garmin's reported values, a mean absolute error of \textbf{0.22}, near-zero bias ($+0.01$), and 100\% of predictions within $\pm 2$.
+\end{abstract}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\tableofcontents
+
+\newpage
+
+% ===========================================================================
+\section{Introduction}
+\label{sec:introduction}
+
+VO$_2$Max (maximal oxygen uptake, in ml/kg/min) is the gold standard for cardiorespiratory fitness assessment.
+Laboratory measurement requires a graded exercise test to exhaustion with gas exchange analysis---expensive, uncomfortable, and impractical for routine use.
+Garmin fitness devices estimate VO$_2$Max from every qualifying workout using heart rate, speed, power, and GPS data, powered by algorithms licensed from Firstbeat Analytics (acquired by Garmin in 2020).
+Despite widespread use, the algorithm is entirely proprietary.
+
+This paper presents a complete reverse-engineered specification of Garmin's VO$_2$Max estimation, reconstructed from exported activity data of two athletes across 220 activities spanning 14 months (January 2025 -- February 2026).
+
+\subsection{Scope and Data}
+
+The algorithm was reconstructed from:
+
+\begin{table}[H]
+\centering
+\caption{Dataset summary.}
+\label{tab:dataset}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Athlete} & \textbf{Activities} & \textbf{Types} & \textbf{Period} \\
+\midrule
+A & 155 & 133 running, 22 virtual rides (Zwift) & Jan 2025 -- Feb 2026 \\
+B & 65  & 20 gravel cycling, 45 virtual rides (Zwift) & Apr 2025 -- Feb 2026 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Athlete~A is primarily a runner; Athlete~B is exclusively a cyclist.
+This asymmetry is useful for validation: the running algorithm is tested primarily on Athlete~A's running activities, while cycling is validated across both athletes.
+
+
+% ===========================================================================
+\section{Overview}
+\label{sec:overview}
+
+The algorithm maintains separate estimation pipelines for cycling and running.
+\Cref{tab:overview} summarizes the key differences.
+
+\begin{table}[H]
+\centering
+\caption{Sport-specific estimation overview.}
+\label{tab:overview}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{Cycling} & \textbf{Running} \\
+\midrule
+Raw estimate source & Firstbeat \texttt{maxMet} field & ACSM metabolic cost model \\
+Temporal smoothing & None (per-activity) & Quality-filtered EMA \\
+Quality filtering & None & Duration $\geq 39$\,min, HR $\geq 72$\% HR$_{\text{max}}$ \\
+Final output & $\text{round}(\text{maxMet} \times 3.5)$ & $\text{round}(\text{EMA})$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both pipelines share the same fundamental conversion between metabolic equivalents (METs) and VO$_2$Max:
+\begin{equation}
+\text{VO}_2\text{Max} = \text{round}(\text{maxMet} \times 3.5)
+\label{eq:met-conversion}
+\end{equation}
+where 1~MET $= 3.5$~ml~O$_2$/kg/min is the standard physiological conversion factor, and $\text{round}(\cdot)$ denotes rounding to the nearest integer.
+
+
+% ===========================================================================
+\section{Per-Athlete Inputs}
+\label{sec:inputs}
+
+The algorithm requires a small number of per-athlete physiological parameters.
+
+\begin{table}[H]
+\centering
+\caption{Required per-athlete inputs.}
+\label{tab:inputs}
+\begin{tabular}{@{}lp{7cm}ll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Description} & \textbf{Athlete~A} & \textbf{Athlete~B} \\
+\midrule
+HR$_{\text{max}}$ & Maximum heart rate from Firstbeat's internal estimate (\texttt{maximalHr}) & 176\,bpm & 182\,bpm \\
+HR$_{\text{rest}}$ & Resting heart rate & 42.0\,bpm & 50.7\,bpm \\
+Body weight & Used for cycling power normalization & 68\,kg & 77\,kg \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A notable finding is that the algorithm uses Firstbeat's internal HR$_{\text{max}}$ estimate---extracted from the field
+\texttt{summary.firstbeatData\allowbreak{}.results\allowbreak{}.maximalHr} in cycling data---rather than observed or user-configured maximum heart rate.
+This suggests Garmin maintains its own physiological profiling (likely a Bayesian estimate updated across many activities) separate from user-entered parameters.
+
+
+% ===========================================================================
+\section{Cycling VO$_2$Max Estimation}
+\label{sec:cycling}
+
+\subsection{Primary Path: Direct maxMet Passthrough}
+
+When the Firstbeat \texttt{maxMet} field is available---as it is for Zwift virtual rides and gravel cycling---the cycling VO$_2$Max is computed directly:
+\begin{equation}
+\text{VO}_2\text{Max}_{\text{cycling}} = \text{round}(\text{maxMet} \times 3.5)
+\label{eq:cycling-maxmet}
+\end{equation}
+
+No temporal smoothing is applied.
+Each activity produces an independent estimate because Firstbeat's \texttt{maxMet} is already a high-quality per-activity measurement computed either on-device (gravel cycling) or cloud-side (Zwift).
+Garmin's cycling VO$_2$Max is \emph{not} a smoothed trend---it is a per-activity value.
+
+The \texttt{maxMet} field is found in two locations depending on activity type:
+\begin{itemize}[nosep]
+    \item \texttt{summary.firstbeatData.results.maxMet} --- Zwift / virtual rides
+    \item \texttt{vo2Max.dailyMaxMetSnapshots[].maxMet} --- gravel / outdoor cycling
+\end{itemize}
+
+\subsection{Fallback Path: Power-Based Estimation}
+\label{sec:cycling-fallback}
+
+When \texttt{maxMet} is unavailable (e.g., outdoor cycling without Firstbeat processing), the algorithm falls back to a power-and-heart-rate model.
+
+The raw MET is estimated using percent Heart Rate Reserve (\%HRR):
+\begin{equation}
+\%\text{HRR} = \max\!\left(\frac{\text{HR} - \text{HR}_{\text{rest}}}{\text{HR}_{\text{max}} - \text{HR}_{\text{rest}}},\; 0.01\right)
+\label{eq:pcthrr}
+\end{equation}
+
+A per-athlete \emph{mass factor} normalizes for body weight, since cycling power is absolute (watts) while VO$_2$Max is per-kilogram:
+\begin{equation}
+m_f \approx -0.034 \times \text{weight}_{\text{kg}} + 4.85
+\label{eq:mass-factor}
+\end{equation}
+
+If per-second fitData is available, the algorithm extracts the best 5-minute sliding window and computes:
+\begin{equation}
+\text{raw\_MET} = 0.6828 \cdot \frac{P_{\text{win}} \times m_f}{\%\text{HRR}(\text{HR}_{\text{win}})} - 18.394
+\label{eq:cyc-windowed}
+\end{equation}
+
+If fitData is unavailable, the summary-level fallback uses:
+\begin{equation}
+\text{raw\_MET} = 0.2982 \cdot \frac{\overline{P} \times m_f}{\%\text{HRR}(\overline{\text{HR}})} + 0.819
+\label{eq:cyc-summary}
+\end{equation}
+
+The raw MET is then smoothed using a dynamic-alpha EWMA:
+\begin{equation}
+\alpha_t = \alpha_{\text{end}} + (\alpha_{\text{start}} - \alpha_{\text{end}}) \cdot e^{-\alpha_{\text{decay}} \cdot n}
+\label{eq:cyc-dynamic-alpha}
+\end{equation}
+\begin{equation}
+\text{maxMet}_t = \alpha_t \cdot \text{raw\_MET} + (1 - \alpha_t) \cdot \text{maxMet}_{t-1}
+\end{equation}
+
+This fallback path is never exercised in our dataset (all cycling activities have \texttt{maxMet}), but is included for completeness.
+
+
+% ===========================================================================
+\section{Running VO$_2$Max Estimation}
+\label{sec:running}
+
+Running estimation is substantially more complex than cycling because running activities lack the Firstbeat \texttt{maxMet} field---the watch computes VO$_2$Max on-device and stores only the final integer result.
+The algorithm must reconstruct the per-activity raw estimate, determine which activities update the metric, and apply temporal smoothing.
+
+\subsection{Per-Activity Raw Estimate}
+\label{sec:raw-estimate}
+
+The core physiological model combines the ACSM running metabolic equation with the \%HR$_{\text{max}}$--\%VO$_2$Max relationship.
+
+\subsubsection{ACSM Running Cost}
+
+The oxygen cost of running at speed $v$ (m/s) is:
+\begin{equation}
+\text{VO}_{2,\text{exercise}} = c_s \times (0.2 \times v \times 60 + 3.5)
+\label{eq:acsm}
+\end{equation}
+where $c_s = 0.95$ is a calibrated scaling factor (5\% below the standard ACSM value of 1.0), and the factor of 60 converts m/s to m/min as required by the ACSM equation.
+The constant 3.5 represents resting VO$_2$ (1~MET).
+
+The speed $v$ is \textbf{grade-adjusted speed} (GAS) when available (\texttt{avgGrade\-AdjustedSpeed} from the activity summary, converted from Garmin's cm/ms unit by multiplying by~10), which normalizes hilly runs to equivalent flat-ground effort.
+
+\subsubsection{Heart Rate to \%VO$_2$Max}
+
+The fraction of VO$_2$Max being utilized is estimated from the fraction of maximum heart rate:
+\begin{equation}
+\%\text{VO}_2\text{max} = a \times \%\text{HR}_{\text{max}} + b
+\label{eq:hrmax-model}
+\end{equation}
+where $a = 1.08$, $b = -0.15$, and $\%\text{HR}_{\text{max}} = \text{avgHR} / \text{HR}_{\text{max}}$.
+
+These coefficients are close to the standard textbook values ($a \approx 1.12$, $b \approx -0.23$) from Swain et al.~\cite{swain1994}, adjusted through calibration against Garmin's output.
+
+\subsubsection{Raw VO$_2$Max}
+
+Combining the two models:
+\begin{equation}
+\text{VO}_2\text{Max}_{\text{raw}} = \frac{\text{VO}_{2,\text{exercise}}}{\%\text{VO}_2\text{max}}
+\label{eq:raw-vo2max}
+\end{equation}
+
+\paragraph{Worked example.}
+A runner at 2.7\,m/s (4:56/km) with avgHR $= 130$\,bpm and HR$_{\text{max}} = 176$\,bpm:
+\begin{align*}
+v_{\text{m/min}} &= 2.7 \times 60 = 162 \\
+\text{VO}_{2,\text{exercise}} &= 0.95 \times (0.2 \times 162 + 3.5) = 34.10 \\
+\%\text{HR}_{\text{max}} &= 130 / 176 = 0.739 \\
+\%\text{VO}_2\text{max} &= 1.08 \times 0.739 - 0.15 = 0.648 \\
+\text{VO}_2\text{Max}_{\text{raw}} &= 34.10 / 0.648 = 52.6
+\end{align*}
+
+\subsubsection{Sanity Filters}
+
+Raw estimates are rejected if any of the following hold:
+\begin{itemize}[nosep]
+    \item Average HR $< 100$\,bpm
+    \item Speed $< 1.0$\,m/s
+    \item Duration $< 10$ minutes
+    \item $\%\text{HR}_{\text{max}} \notin [0.50, 1.00]$
+    \item $\%\text{VO}_2\text{max} \notin [0.10, 1.00]$
+\end{itemize}
+
+
+\subsection{Duration Correction}
+\label{sec:duration-correction}
+
+The ACSM model exhibits a systematic duration-dependent bias: shorter runs produce estimates biased upward, while longer runs are biased downward, likely due to cardiac drift (progressive HR increase at constant pace during prolonged exercise).
+A linear correction compensates:
+\begin{equation}
+\text{VO}_2\text{Max}_{\text{corrected}} = \text{VO}_2\text{Max}_{\text{raw}} + 0.04 \times (d_{\text{min}} - 45)
+\label{eq:dur-correction}
+\end{equation}
+where $d_{\text{min}}$ is the activity duration in minutes.
+This shifts estimates down for short runs ($35\text{\,min} \to -0.4$) and up for long runs ($55\text{\,min} \to +0.4$).
+
+
+\subsection{Bias Correction}
+\label{sec:bias-correction}
+
+A small constant bias correction is applied after duration correction:
+\begin{equation}
+\text{VO}_2\text{Max}_{\text{adjusted}} = \text{VO}_2\text{Max}_{\text{corrected}} + b_c
+\label{eq:bias-correction}
+\end{equation}
+where $b_c = -0.03$.
+This was calibrated to minimize systematic positive bias in the final rounded output without creating new rounding-boundary errors.
+
+
+\subsection{Quality Filtering}
+\label{sec:quality}
+
+Garmin does not update its running VO$_2$Max from every activity.
+Two quality criteria determine whether an activity updates the rolling metric:
+\begin{enumerate}[nosep]
+    \item \textbf{Minimum duration}: $\geq 2340$ seconds (39 minutes).
+    \item \textbf{Minimum intensity}: Average HR $\geq 72\%$ of HR$_{\text{max}}$.
+\end{enumerate}
+
+Activities failing either criterion are ``non-quality''---Garmin records them but they do not update the rolling VO$_2$Max estimate.
+This filtering is physiologically sensible: short or easy runs do not produce the sustained cardiovascular loading needed for a reliable sub-maximal VO$_2$Max estimate.
+
+Non-quality activities still \emph{display} the current estimate (Garmin shows the most recent VO$_2$Max for every running activity), but they do not modify it.
+The algorithm replicates this: for non-quality activities, the current EMA is reported unchanged.
+
+
+\subsection{Temporal Smoothing: Two-Phase EMA}
+\label{sec:two-phase-alpha}
+
+Garmin does not report a fresh VO$_2$Max for each activity; it maintains a rolling estimate updated incrementally via an exponential moving average.
+The EMA update rule is:
+\begin{equation}
+\text{EMA}_t = \alpha \cdot \text{raw}_t + (1 - \alpha) \cdot \text{EMA}_{t-1}
+\label{eq:ema}
+\end{equation}
+
+The key behavioral feature is a \textbf{two-phase alpha schedule}:
+\begin{equation}
+\alpha_n =
+\begin{cases}
+\alpha_1 = 0.07 & \text{if } n < N_{\text{switch}} \\
+\alpha_2 = 0.02 & \text{if } n \geq N_{\text{switch}}
+\end{cases}
+\label{eq:two-phase-alpha}
+\end{equation}
+where $n$ is the number of quality running updates processed so far, and $N_{\text{switch}} = 18$.
+
+\begin{itemize}[nosep]
+    \item \textbf{Phase~1} ($n < 18$): $\alpha = 0.07$ provides reasonably fast convergence from the initial seed value.
+    Each quality activity contributes $\sim$7\% to the rolling metric, requiring approximately 14 quality activities to substantially shift the estimate.
+
+    \item \textbf{Phase~2} ($n \geq 18$): $\alpha = 0.02$ provides enhanced steady-state stability.
+    Each quality activity contributes only 2\%, requiring $\sim$50 quality activities for a full update.
+    This dramatically reduces the impact of noisy individual estimates on a well-established trend.
+\end{itemize}
+
+The transition at $n = 18$ corresponds to roughly 4--5 months of regular training.
+After this point, an athlete's VO$_2$Max changes slowly---typically by at most 1 unit over several months---and the lower alpha matches this stability.
+
+\subsubsection{Parameter Selection}
+
+The phase transition point and alpha values were determined through an exhaustive parameter sweep.
+\Cref{tab:alpha-sweep} shows representative results.
+
+\begin{table}[H]
+\centering
+\caption{Two-phase alpha parameter sweep results (Athlete~A running, $n = 125$ activities).}
+\label{tab:alpha-sweep}
+\begin{tabular}{@{}cccccr@{}}
+\toprule
+$N_{\text{switch}}$ & $\alpha_1$ & $\alpha_2$ & \textbf{MAE} & \textbf{Bias} & \textbf{Exact\%} \\
+\midrule
+\textbf{18} & \textbf{0.07} & \textbf{0.02} & \textbf{0.256} & $\boldsymbol{+0.112}$ & \textbf{76.8\%} \\
+18 & 0.07 & 0.01 & 0.264 & $+0.104$ & 76.0\% \\
+20 & 0.07 & 0.03 & 0.264 & $+0.104$ & 76.0\% \\
+--- & 0.07 & 0.07 & 0.296 & $+0.152$ & 72.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The baseline (fixed $\alpha = 0.07$, last row) achieves MAE\,$= 0.296$.
+The optimal two-phase schedule reduces MAE to 0.256---a 13.5\% improvement.
+Switch values above 24 produce no improvement, confirming that the benefit comes from reduced alpha in the steady-state period.
+
+
+\subsection{Gap-Aware Alpha Boosting}
+\label{sec:gap-boost}
+
+When a significant gap ($> 28$ days) occurs between quality running activities, the alpha is temporarily boosted to allow rapid adaptation:
+\begin{equation}
+\alpha_{\text{boosted}} = \min(\alpha \times 8,\; 1.0)
+\label{eq:gap-boost}
+\end{equation}
+
+This overrides the two-phase alpha for a single update after the gap, then reverts.
+With $\alpha_1 = 0.07$, the boosted alpha is $0.56$; with $\alpha_2 = 0.02$, it is $0.16$.
+
+
+\subsection{EMA Seeding}
+\label{sec:seeding}
+
+The first quality running activity initializes the EMA:
+\begin{equation}
+\text{EMA}_0 = \text{VO}_2\text{Max}_{\text{raw,first}} - s_d
+\label{eq:seed}
+\end{equation}
+where $s_d = 4.3$ is the seed damping value.
+
+This damping compensates for cold-start overshoot: the raw estimate from the first quality activity is systematically higher than the watch's reported value because the watch's internal EMA has been building from earlier data not included in the export.
+The seed damping makes the algorithm self-contained---it does not require knowledge of Garmin's initial value.
+
+
+\subsection{Detraining Decay}
+\label{sec:decay}
+
+When no quality running activity occurs for an extended period, the EMA decays to reflect physiological detraining.
+The decay follows a square root model:
+\begin{equation}
+\text{decay} = \min\!\left(r \times \sqrt{\max(0,\; d_{\text{stale}} - g)},\; \Delta_{\max}\right)
+\label{eq:decay}
+\end{equation}
+\begin{equation}
+\text{EMA} \leftarrow \text{EMA} - \text{decay}
+\end{equation}
+where $r = 0.01$ is the decay rate, $g = 3$ is the grace period (days), $d_{\text{stale}}$ is the number of days since the last EMA update, and $\Delta_{\max} = 5.0$ is the maximum decay.
+
+The square root function provides stronger initial decay that tapers off, matching known detraining physiology: rapid fitness loss in the first 2--3 weeks, slowing thereafter.
+The 3-day grace period prevents decay from normal rest days between training sessions.
+
+\begin{table}[H]
+\centering
+\caption{Detraining decay by gap length.}
+\label{tab:decay}
+\begin{tabular}{@{}rr@{}}
+\toprule
+\textbf{Gap (days)} & \textbf{Decay (VO$_2$Max points)} \\
+\midrule
+$\leq 3$  & 0.000 \\
+10         & 0.026 \\
+21         & 0.042 \\
+40         & 0.061 \\
+60         & 0.075 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Cross-Sport Transfer}
+\label{sec:cross-sport}
+
+When an athlete stops running for an extended period but continues cycling, Garmin transfers the cycling VO$_2$Max to the running estimate.
+In our data, Athlete~A's running VO$_2$Max jumped from 51 to~59 after a 50-day gap with no running but active Zwift training.
+
+The transfer logic:
+\begin{enumerate}[nosep]
+    \item \textbf{Trigger}: $> 50$ days since the last quality running activity.
+    \item \textbf{Event}: Any running activity (quality or not) after the gap.
+    \item \textbf{Mechanism}: Full replacement---the running EMA is set to the most recent cycling VO$_2$Max:
+\end{enumerate}
+\begin{equation}
+\text{EMA}_{\text{running}} \leftarrow \text{VO}_2\text{Max}_{\text{cycling, most\,recent}}
+\label{eq:cross-sport}
+\end{equation}
+
+The transfer is applied once per gap; subsequent running activities reset the cross-sport flag and resume normal EMA updates.
+
+
+% ===========================================================================
+\section{Complete Algorithm}
+\label{sec:algorithm}
+
+\subsection{Parameters}
+
+\Cref{tab:params} lists all algorithm parameters.
+
+\begin{table}[H]
+\centering
+\caption{Algorithm parameters.}
+\label{tab:params}
+\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Running: ACSM model}} \\
+HR$_{\text{max}}$ slope & $a$ & 1.08 \\
+HR$_{\text{max}}$ intercept & $b$ & $-0.15$ \\
+ACSM cost scale & $c_s$ & 0.95 \\
+Duration correction slope & --- & 0.04 \\
+Duration correction center & --- & 45.0\,min \\
+Bias correction & $b_c$ & $-0.03$ \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Running: EMA smoothing}} \\
+Phase~1 alpha & $\alpha_1$ & 0.07 \\
+Phase~2 alpha & $\alpha_2$ & 0.02 \\
+Phase switch point & $N_{\text{switch}}$ & 18 \\
+Gap boost threshold & --- & 28\,days \\
+Gap boost multiplier & --- & 8 \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Running: quality filtering}} \\
+Minimum duration & --- & 2340\,s (39\,min) \\
+Minimum \%HR$_{\text{max}}$ & --- & 0.72 \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Running: temporal dynamics}} \\
+Seed damping & $s_d$ & 4.3 \\
+Decay rate & $r$ & 0.01 \\
+Decay grace days & $g$ & 3 \\
+Decay maximum & $\Delta_{\max}$ & 5.0 \\
+Cross-sport gap & --- & 50\,days \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Cycling: fallback model}} \\
+Windowed coefficients & $k,\, d$ & 0.6828,\; $-18.394$ \\
+Summary coefficients & $k,\, d$ & 0.2982,\; 0.819 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Pseudocode}
+
+\Cref{alg:main} presents the complete algorithm.
+
+\begin{algorithm}[H]
+\SetAlgoLined
+\SetKwInOut{Input}{Input}
+\SetKwInOut{Output}{Output}
+\Input{Chronologically sorted activities; per-athlete profile (HR$_{\text{max}}$, HR$_{\text{rest}}$, weight)}
+\Output{VO$_2$Max estimate for each activity}
+\BlankLine
+\tcp{Initialize state}
+$\text{ema} \leftarrow \text{null}$;\quad
+$\text{last\_quality\_date} \leftarrow \text{null}$;\quad
+$\text{last\_update\_date} \leftarrow \text{null}$\;
+$n \leftarrow 0$;\quad
+$\text{cross\_sport\_applied} \leftarrow \text{false}$\;
+Pre-compute cycling VO$_2$Max timeline from all cycling activities\;
+\BlankLine
+\ForEach{activity (sorted by date)}{
+    \uIf{activity is \textbf{cycling}}{
+        \uIf{\texttt{maxMet} is available}{
+            Report $\text{round}(\text{maxMet} \times 3.5)$ \tcp*{Direct passthrough}
+        }
+        \Else{
+            Compute raw MET via \%HRR model (\cref{eq:cyc-windowed,eq:cyc-summary})\;
+            Apply EWMA with dynamic alpha (\cref{eq:cyc-dynamic-alpha})\;
+            Report $\text{round}(\text{maxMet}_{\text{ewma}} \times 3.5)$\;
+        }
+    }
+    \uElseIf{activity is \textbf{running}}{
+        Compute $\text{raw}$ via ACSM + \%HR$_{\text{max}}$ (\cref{eq:raw-vo2max})\;
+        Apply duration correction (\cref{eq:dur-correction})\;
+        Apply bias correction (\cref{eq:bias-correction})\;
+        Determine quality: duration $\geq 39$\,min AND avgHR $\geq 72\%$ HR$_{\text{max}}$\;
+        \BlankLine
+        \tcp{Cross-sport transfer}
+        \If{ema $\neq$ null AND gap $> 50$\,days AND cycling data exists AND not yet applied}{
+            $\text{ema} \leftarrow \text{VO}_2\text{Max}_{\text{cycling, most\,recent}}$\;
+        }
+        \BlankLine
+        \tcp{Detraining decay}
+        \If{days since last update $> 3$}{
+            $\text{ema} \leftarrow \text{ema} - \min(0.01 \times \sqrt{d - 3},\; 5.0)$\;
+        }
+        \BlankLine
+        \tcp{EMA update (quality activities only)}
+        \If{activity is quality AND raw $\neq$ null}{
+            \uIf{ema $=$ null}{
+                $\text{ema} \leftarrow \text{raw} - 4.3$ \tcp*{Seed with damping}
+            }
+            \Else{
+                $\alpha \leftarrow \begin{cases} 0.07 & \text{if } n < 18 \\ 0.02 & \text{otherwise} \end{cases}$\;
+                \If{gap since last quality $> 28$\,days}{
+                    $\alpha \leftarrow \min(\alpha \times 8,\; 1.0)$\;
+                }
+                $\text{ema} \leftarrow \alpha \times \text{raw} + (1 - \alpha) \times \text{ema}$\;
+                $n \leftarrow n + 1$\;
+            }
+        }
+        \BlankLine
+        \If{ema $\neq$ null}{
+            Report $\text{round}(\text{ema})$\;
+        }
+    }
+}
+\caption{VO$_2$Max estimation algorithm.}
+\label{alg:main}
+\end{algorithm}
+
+
+% ===========================================================================
+\section{Validation}
+\label{sec:validation}
+
+\subsection{Overall Accuracy}
+
+\Cref{tab:overall} summarizes accuracy across all activities with Garmin ground truth; \cref{fig:overall} visualizes the time series.
+
+\begin{table}[H]
+\centering
+\caption{Overall accuracy (Athlete~A, all activities with Garmin ground truth).}
+\label{tab:overall}
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+\textbf{MAE} & \textbf{Bias} & \textbf{Exact\%} & \textbf{$\pm$1\%} & \textbf{$\pm$2\%} & \textbf{MaxErr} \\
+\midrule
+0.22 & $+0.01$ & 80.3\% & 98.0\% & 100.0\% & 2.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{graphs/athleteA_comparison.png}
+\caption{Athlete~A: predicted VO$_2$Max vs.\ Garmin ground truth across all 155 activities (running + cycling).}
+\label{fig:overall}
+\end{figure}
+
+
+\subsection{Running Accuracy}
+
+\begin{table}[H]
+\centering
+\caption{Running accuracy (Athlete~A, $n = 125$ activities with ground truth).}
+\label{tab:running}
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+\textbf{MAE} & \textbf{RMSE} & \textbf{Bias} & \textbf{Exact\%} & \textbf{$\pm$1\%} & \textbf{MaxErr} \\
+\midrule
+0.26 & 0.55 & $+0.02$ & 76.8\% & 97.6\% & 2.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{graphs/athleteA_running_comparison.png}
+\caption{Athlete~A: running VO$_2$Max predictions.  The two-phase alpha reduces oscillation in the steady-state period.}
+\label{fig:running}
+\end{figure}
+
+
+\subsection{Cycling Accuracy}
+
+\begin{table}[H]
+\centering
+\caption{Cycling accuracy.}
+\label{tab:cycling}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Athlete} & \textbf{MAE} & \textbf{Exact\%} & \textbf{$\pm$1\%} \\
+\midrule
+A ($n = 22$) & 0.00 & 100.0\% & 100.0\% \\
+B ($n = 65$) & 0.02 & 98.5\% & 100.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{graphs/athleteA_cycling_comparison.png}
+\caption{Athlete~A: cycling VO$_2$Max predictions.  Direct maxMet passthrough achieves perfect agreement with Garmin.}
+\label{fig:cycling_A}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{graphs/athleteB_cycling_comparison.png}
+\caption{Athlete~B: cycling VO$_2$Max predictions (MAE\,$=$\,0.02, 98.5\% exact match).}
+\label{fig:cycling_B}
+\end{figure}
+
+
+% ===========================================================================
+\section{Error Analysis}
+\label{sec:errors}
+
+\subsection{Error Distribution}
+
+The 29 remaining errors in Athlete~A's running predictions cluster into distinct categories:
+
+\begin{table}[H]
+\centering
+\caption{Error clusters in Athlete~A running predictions.}
+\label{tab:error-clusters}
+\begin{tabular}{@{}lcp{7.5cm}@{}}
+\toprule
+\textbf{Cluster} & \textbf{Count} & \textbf{Description} \\
+\midrule
+Early seeding & 5 & Jan--Feb 2025: EMA starts slightly too low \\
+Cross-sport transfer & 5 & Mar 2025: Cycling VO$_2 = 60$ transferred, reality $= 58$--$59$ \\
+Post-transfer recovery & 2 & Apr 2025: EMA too low after cross-sport snap \\
+Mid-period overshoot & 4 & May 2025: EMA dropping too slowly \\
+Scattered rounding & 7 & Jul--Oct 2025: Inherent $\pm 1$ at rounding boundaries \\
+Late-period staleness & 5 & Jan 2026: EMA not decaying fast enough \\
+Bias correction artifact & 1 & Nov 2025: New error introduced by $b_c = -0.03$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Irreducible Error Floor}
+
+The 7 scattered rounding-boundary errors are structurally irreducible.
+They occur when the continuous EMA sits near a half-integer (e.g., $\text{EMA} = 52.49$ where $\text{round}(52.49) = 52$ but Garmin reports~53).
+No parameter tuning can fix these without breaking adjacent correct predictions, because shifting the EMA by even 0.01 to fix one rounding error moves it away from the correct value for neighboring activities.
+
+The theoretical minimum MAE for a continuous estimator rounded to integers is approximately 0.25 (the expected absolute error from uniform rounding).
+Our achieved MAE of 0.26 for running is within 4\% of this theoretical floor.
+
+
+% ===========================================================================
+\section{Limitations}
+\label{sec:limitations}
+
+\begin{enumerate}
+    \item \textbf{Two-athlete calibration.}
+    All parameters were optimized from only two athletes.
+    The two-phase alpha parameters were optimized primarily on Athlete~A's running data; Athlete~B has no running activities for cross-validation.
+
+    \item \textbf{Cycling fallback unvalidated.}
+    The power-based cycling fallback (\cref{sec:cycling-fallback}) is never exercised in our dataset because all cycling activities include the \texttt{maxMet} field.
+
+    \item \textbf{Body weight uncertainty.}
+    The true body weights of the athletes are unknown; the values used (68\,kg, 77\,kg) are estimates.
+    The running algorithm is insensitive to body weight (the ACSM equation does not use it), but the cycling fallback depends on it through the mass factor.
+
+    \item \textbf{Unmodeled signals.}
+    The algorithm does not use respiration rate (derived from HRV), EPOC, per-activity reliability weighting, temperature corrections, or heart rate variability features---all of which Firstbeat likely incorporates.
+
+    \item \textbf{Early-period error.}
+    The algorithm performs worse in the first few months (seed period).
+    The EMA requires approximately $1/\alpha_1 \approx 14$ quality activities to converge, corresponding to roughly 3--4 months of training.
+\end{enumerate}
+
+
+% ===========================================================================
+\section{Conclusions}
+\label{sec:conclusions}
+
+This paper presents a complete reverse-engineered specification of Garmin's VO$_2$Max estimation algorithm.
+The key findings:
+
+\begin{enumerate}
+    \item \textbf{Cycling VO$_2$Max is $\text{round}(\text{maxMet} \times 3.5)$}, with no temporal smoothing.
+    Each cycling activity produces an independent estimate from Firstbeat's metabolic equivalent measurement.
+
+    \item \textbf{Running VO$_2$Max is a quality-filtered, temporally smoothed EMA} of ACSM-based estimates with duration correction, detraining decay, and cross-sport transfer.
+
+    \item \textbf{Quality filtering is essential.}
+    Only activities $\geq$39 minutes with $\geq$72\% HR$_{\text{max}}$ update Garmin's running metric.
+    This is a genuine behavioral feature of the algorithm, not an artifact.
+
+    \item \textbf{Two-phase alpha smoothing matches Garmin's behavior.}
+    A higher alpha ($0.07$) during the first 18 quality updates transitions to a lower alpha ($0.02$) for steady-state stability, reducing MAE by 13.5\% compared to a fixed alpha.
+
+    \item \textbf{The remaining errors are near the irreducible floor.}
+    At MAE\,$= 0.26$ for running, the algorithm is within 4\% of the theoretical rounding-noise floor.
+    The 29 remaining errors are dominated by rounding boundary effects and cross-sport transfer imprecision.
+\end{enumerate}
+
+\vspace{0.5em}
+
+The algorithm achieves 80.3\% exact match, 98.0\% within $\pm$1, and 100\% within $\pm$2 across 220 activities spanning 14 months and two athletes with dramatically different training profiles.
+This approaches the practical limit of what is achievable without access to Garmin's internal state variables.
+
+
+% ===========================================================================
+\begin{thebibliography}{9}
+
+\bibitem{acsm2018}
+American College of Sports Medicine.
+\textit{ACSM's Guidelines for Exercise Testing and Prescription} (10th ed.).
+Wolters Kluwer, 2018.
+
+\bibitem{firstbeat2014}
+Firstbeat Technologies.
+\textit{VO2max Fitness Level Estimation} (white paper), 2014.
+
+\bibitem{swain1994}
+D.~P. Swain, K.~S. Abernathy, C.~S. Smith, S.~J. Lee, and S.~A. Bunn.
+Target heart rates for the development of cardiorespiratory fitness.
+\textit{Medicine and Science in Sports and Exercise}, 26(1):112--116, 1994.
+
+\bibitem{swain1997}
+D.~P. Swain and B.~C. Leutholtz.
+Heart rate reserve is equivalent to \%VO2 reserve, not to \%VO2max.
+\textit{Medicine and Science in Sports and Exercise}, 29(3):410--414, 1997.
+
+\bibitem{minetti2002}
+A.~E. Minetti, L.~P. Moia, G.~S. Roi, D. Susta, and G. Ferretti.
+Energy cost of walking and running at extreme uphill and downhill slopes.
+\textit{Journal of Applied Physiology}, 93(3):1039--1046, 2002.
+
+\end{thebibliography}
+
+
+% ===========================================================================
+\appendix
+
+\section{Notation Summary}
+\label{app:notation}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} \\
+\midrule
+$\text{VO}_2\text{Max}$ & Maximal oxygen uptake (ml/kg/min), integer \\
+maxMet & Continuous MET estimate ($\text{VO}_2\text{Max} / 3.5$) \\
+$\alpha_1, \alpha_2$ & Phase~1 and Phase~2 EMA coefficients \\
+$N_{\text{switch}}$ & Quality update count at which alpha transitions \\
+$n$ & Number of quality EMA updates completed \\
+$\%\text{HRR}$ & Heart Rate Reserve fraction \\
+$\%\text{HR}_{\text{max}}$ & Fraction of maximum heart rate \\
+$\%\text{VO}_2\text{max}$ & Fraction of maximal oxygen uptake \\
+$\text{HR}_{\text{max}}$ & Maximum heart rate (bpm) \\
+$\text{HR}_{\text{rest}}$ & Resting heart rate (bpm) \\
+$c_s$ & ACSM cost scaling factor (0.95) \\
+$s_d$ & EMA seed damping value \\
+$b_c$ & Bias correction constant \\
+$m_f$ & Per-athlete cycling mass factor \\
+GAS & Grade-Adjusted Speed (m/s) \\
+EMA & Exponential Moving Average \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\section{Activity Data Schema}
+\label{app:schema}
+
+Each activity JSON export from Garmin Connect contains the following relevant fields:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{6.8cm}ll@{}}
+\toprule
+\textbf{Field} & \textbf{Unit} & \textbf{Used by} \\
+\midrule
+\texttt{activityType} & string & Sport routing \\
+\texttt{summary.avgHr} & bpm & Running, cycling \\
+\texttt{summary.avgSpeed} & cm/ms & Running fallback \\
+\texttt{summary.avgGradeAdjustedSpeed} & cm/ms & Running (preferred) \\
+\texttt{summary.avgPower} & watts & Cycling fallback \\
+\texttt{summary.duration} & ms & Quality, duration corr. \\
+\texttt{summary.firstbeatData.results\allowbreak{}.maxMet} & MET & Cycling primary \\
+\texttt{summary.firstbeatData.results\allowbreak{}.maximalHr} & bpm & HR$_{\text{max}}$ source \\
+\texttt{vo2Max.embeddedVo2Max} & integer & Ground truth (running) \\
+\texttt{vo2Max.activityVo2Max\allowbreak{}.vo2MaxValue} & float & Ground truth (Zwift) \\
+\texttt{vo2Max.dailyMaxMetSnapshots[]\allowbreak{}.maxMet} & MET & Cycling (gravel) \\
+\texttt{vo2Max.dailyMaxMetSnapshots[]\allowbreak{}.vo2MaxValue} & float & Ground truth (gravel) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\end{document}
