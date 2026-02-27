@@ -201,35 +201,43 @@ For the scenarios above, the ACSM leg ergometry equation produces:
 (https://github.com/JohanBellander/vo2maxe). See GitHub issue #1 for the
 original bug report.*
 
-## 9. Resolution (Whitepaper Rev2)
+## 9. Resolution (Whitepaper Rev2 and Rev3)
 
-The whitepaper author released a revised version (rev2) that addresses this issue.
-The key change: **the mass factor is now a per-athlete calibrated constant**, not
-a formula derived from weight.
+The whitepaper author released revised versions that address this issue.
 
-### What changed
+### Rev2
 
-- The old formula `mf = -0.034 × weight + 4.85` (which produced values ~2.0-3.0,
-  causing the 12-15x overscale) has been **removed**.
-- Instead, per-athlete calibrated mass factors are provided:
-  - Athlete A (68 kg): `mf = 0.210`
-  - Athlete B (77 kg): `mf = 0.198`
-- The paper now states: *"it cannot be derived from a simple formula because it
-  absorbs coupling between the linear coefficients k, d and the athlete's
-  physiological efficiency."*
-- A worked example is included confirming the corrected math:
-  - Input: Athlete A (68kg, HRrest=42, HRmax=176, mf=0.210), P_avg=180W, HR_avg=140bpm
-  - %HRR = (140-42)/(176-42) = 0.731
-  - inner = 180 × 0.210 / 0.731 = 51.71
-  - raw_MET = 0.2982 × 51.71 + 0.819 = 16.24
-  - VO2Max = round(16.24 × 3.5) = round(56.8) = **57**
-- The linear coefficients k and d are **unchanged**.
+Rev2 replaced the broken formula with per-athlete calibrated constants
+(`mf = 0.210` for Athlete A, `mf = 0.198` for Athlete B), stating the mass
+factor "cannot be derived from a simple formula."
+
+### Rev3 (current)
+
+Rev3 provides an explicit linear model fitted to the two athletes:
+
+```
+mf = -0.00131 × weight_kg + 0.299
+```
+
+This produces `mf = 0.210` for 68 kg and `mf = 0.198` for 77 kg — the same
+calibrated values, now expressed as a formula. The paper includes a caveat
+that this is a two-point fit and accuracy outside the 68-77 kg calibration
+range is uncertain.
+
+A worked example is included confirming the corrected math:
+- Input: Athlete A (68kg, HRrest=42, HRmax=176), P_avg=180W, HR_avg=140bpm
+- mf = -0.00131 × 68 + 0.299 = 0.210
+- %HRR = (140-42)/(176-42) = 0.731
+- inner = 180 × 0.210 / 0.731 = 51.71
+- raw_MET = 0.2982 × 51.71 + 0.819 = 16.24
+- VO2Max = round(16.24 × 3.5) = round(56.8) = **57**
+
+The linear coefficients k and d are **unchanged** across all revisions.
 
 ### Impact on the library
 
-The vo2maxe library (v0.2.0+) implements the rev2 approach:
-- `AthleteProfile` accepts an optional `massFactor` field for the calibrated value.
-- When `massFactor` is not provided, a default is estimated by linear interpolation
-  from the two calibrated data points (slope ≈ -0.00133, intercept ≈ 0.301).
-- A MET clamp (1-30) is applied as a safety net for uncalibrated profiles.
+The vo2maxe library implements the rev3 formula:
+- `getMassFactor()` applies `mf = -0.00131 × weight + 0.299` by default.
+- `AthleteProfile` accepts an optional `massFactor` field to override the formula.
+- A MET clamp (1-30) is applied as a safety net.
 - The issue #1 scenario (146W, 119bpm, 75kg) now produces VO2Max ≈ 65 instead of ~714.

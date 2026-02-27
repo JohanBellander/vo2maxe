@@ -63,6 +63,14 @@ describe("percentHrr", () => {
 });
 
 describe("getMassFactor", () => {
+  it("should match whitepaper Eq. 3 formula exactly", () => {
+    // mf = -0.00131 × weight + 0.299
+    const profileA: AthleteProfile = { maxHr: 176, restingHr: 42, weightKg: 68 };
+    const profileB: AthleteProfile = { maxHr: 182, restingHr: 50.7, weightKg: 77 };
+    expect(getMassFactor(profileA)).toBeCloseTo(-0.00131 * 68 + 0.299, 5);
+    expect(getMassFactor(profileB)).toBeCloseTo(-0.00131 * 77 + 0.299, 5);
+  });
+
   it("should return explicit massFactor when provided", () => {
     expect(getMassFactor(athleteA)).toBe(0.21);
     expect(getMassFactor(athleteB)).toBe(0.198);
@@ -71,9 +79,8 @@ describe("getMassFactor", () => {
   it("should estimate mf from weight when not provided", () => {
     const profile: AthleteProfile = { maxHr: 176, restingHr: 42, weightKg: 68 };
     const mf = getMassFactor(profile);
-    // Default interpolation from (68, 0.210) and (77, 0.198):
-    // slope ≈ -0.001333, intercept ≈ 0.3007
-    // mf(68) ≈ -0.001333 * 68 + 0.3007 ≈ 0.210
+    // Whitepaper Eq. 3: mf = -0.00131 × weight + 0.299
+    // mf(68) = -0.00131 × 68 + 0.299 ≈ 0.210
     expect(mf).toBeCloseTo(0.21, 3);
   });
 
@@ -84,13 +91,14 @@ describe("getMassFactor", () => {
       weightKg: 77,
     };
     const mf = getMassFactor(profile);
+    // mf(77) = -0.00131 × 77 + 0.299 ≈ 0.198
     expect(mf).toBeCloseTo(0.198, 3);
   });
 
   it("should extrapolate for other weights", () => {
     const profile: AthleteProfile = { maxHr: 190, restingHr: 50, weightKg: 75 };
     const mf = getMassFactor(profile);
-    // Between the two calibrated points: should be ~0.200-0.210
+    // mf(75) = -0.00131 × 75 + 0.299 ≈ 0.201
     expect(mf).toBeGreaterThan(0.19);
     expect(mf).toBeLessThan(0.22);
   });
@@ -140,8 +148,9 @@ describe("rawMetWindowed", () => {
 
 describe("rawMetSummary", () => {
   it("should match whitepaper rev2 worked example", () => {
-    // Whitepaper rev2 worked example:
-    // Athlete A (68kg, HRrest=42, HRmax=176, mf=0.210)
+    // Whitepaper worked example (summary model):
+    // Athlete A (68kg, HRrest=42, HRmax=176)
+    // mf = -0.00131 × 68 + 0.299 = 0.210
     // P_avg=180W, HR_avg=140bpm
     // %HRR = (140-42)/(176-42) = 0.731
     // inner = 180 × 0.210 / 0.731 = 51.71
@@ -274,7 +283,7 @@ describe("estimateCyclingVo2Max", () => {
       const activity = makeCyclingActivity({ avgPower: 180, avgHr: 140 });
       const result = estimateCyclingVo2Max(activity, profileNoMf);
       expect(result).not.toBeNull();
-      // Default mf for 68kg ≈ 0.210 (same as calibrated), so result should be close
+      // Formula mf for 68kg ≈ 0.210 (same as calibrated), so result should match
       expect(result!.vo2Max).toBe(57);
     });
 

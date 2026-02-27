@@ -5,9 +5,10 @@
  * - Primary path: direct maxMet passthrough (Eq. 2)
  * - Fallback path: power-based estimation with %HRR model (Eqs. 3-7)
  *
- * The mass factor (mf) is a per-athlete calibrated constant (whitepaper rev2).
- * When not provided, a default is estimated by linear interpolation from
- * the two calibrated data points in the whitepaper.
+ * The mass factor (mf) normalizes absolute power (watts) for body weight.
+ * A linear model fitted to two athletes is used by default (Eq. 3):
+ *   mf = -0.00131 × weight_kg + 0.299
+ * An explicit override can be provided via AthleteProfile.massFactor.
  */
 
 import { CONSTANTS } from "./constants.js";
@@ -26,24 +27,22 @@ export function percentHrr(
 }
 
 /**
- * Get the per-athlete mass factor.
+ * Get the mass factor for cycling power normalization.
  *
  * If the athlete profile includes an explicit massFactor, it is used directly.
- * Otherwise, a default estimate is derived by linear interpolation from the
- * two calibrated data points in the whitepaper:
- *   Athlete A (68 kg) → mf = 0.210
- *   Athlete B (77 kg) → mf = 0.198
+ * Otherwise, the linear model from the whitepaper (Eq. 3) is applied:
+ *   mf = -0.00131 × weight_kg + 0.299
  *
- * The default is approximate; for best accuracy, calibrate mf per athlete
- * against known VO2Max values.
+ * This formula is a two-point fit (68 kg → 0.210, 77 kg → 0.198).
+ * Accuracy outside the 68-77 kg calibration range is uncertain.
  */
 export function getMassFactor(profile: AthleteProfile): number {
   if (profile.massFactor != null) {
     return profile.massFactor;
   }
   return (
-    CONSTANTS.DEFAULT_MF_WEIGHT_SLOPE * profile.weightKg +
-    CONSTANTS.DEFAULT_MF_INTERCEPT
+    CONSTANTS.MASS_FACTOR_SLOPE * profile.weightKg +
+    CONSTANTS.MASS_FACTOR_INTERCEPT
   );
 }
 

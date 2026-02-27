@@ -28,7 +28,7 @@ const estimator = new VO2MaxEstimator({
   maxHr: 176,       // Firstbeat's internal HRmax estimate (bpm)
   restingHr: 42,    // Resting heart rate (bpm)
   weightKg: 68,     // Body weight (kg, used for cycling power normalization)
-  massFactor: 0.21, // Optional: per-athlete calibrated mass factor (cycling fallback)
+  massFactor: 0.21, // Optional: override mass factor for cycling fallback (default from Eq. 3)
 });
 
 // 2. Process activities in chronological order
@@ -65,7 +65,7 @@ VO2Max = round(maxMet * 3.5)
 
 No temporal smoothing is applied -- each activity produces an independent estimate.
 
-When `maxMet` is unavailable, a power-based fallback uses average power and heart rate with a per-athlete calibrated mass factor and a dynamic-alpha EWMA. The mass factor converts raw watts into a metabolic intensity proxy; if not provided, a default is estimated by linear interpolation from the two calibrated data points in the whitepaper. For best accuracy, calibrate `massFactor` per athlete against known VO2Max values.
+When `maxMet` is unavailable, a power-based fallback uses average power and heart rate with a mass factor and a dynamic-alpha EWMA. The mass factor normalizes watts for body weight using a linear model fitted to two athletes: `mf = -0.00131 * weight_kg + 0.299`. This is a two-point fit; accuracy outside the 68-77 kg calibration range is uncertain. An explicit `massFactor` override can be provided on `AthleteProfile` for re-calibrated values.
 
 ### Running
 
@@ -118,8 +118,8 @@ interface AthleteProfile {
   maxHr: number;       // Maximum heart rate (bpm) - Firstbeat's internal estimate
   restingHr: number;   // Resting heart rate (bpm)
   weightKg: number;    // Body weight (kg)
-  massFactor?: number; // Per-athlete calibrated mass factor for cycling fallback.
-                       // If omitted, estimated from weight via linear interpolation.
+  massFactor?: number; // Override for cycling mass factor (Eq. 3).
+                       // Default: -0.00131 * weightKg + 0.299
 }
 ```
 
