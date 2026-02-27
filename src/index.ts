@@ -27,9 +27,10 @@ export { CONSTANTS } from "./constants.js";
 
 // Cycling estimation functions (exposed for advanced usage)
 export {
+  clampMet,
   cyclingDynamicAlpha,
   estimateCyclingVo2Max,
-  massFactor,
+  getMassFactor,
   percentHrr,
   rawMetSummary,
   rawMetWindowed,

@@ -20,6 +20,25 @@ export interface AthleteProfile {
   restingHr: number;
   /** Body weight in kg. Used for cycling power normalization. */
   weightKg: number;
+  /**
+   * Per-athlete cycling mass factor for the power-based fallback path.
+   *
+   * This is an empirically calibrated constant that normalizes absolute power
+   * (watts) for body weight in the cycling fallback formulas. It cannot be
+   * derived from a simple formula — it absorbs coupling between the linear
+   * coefficients (k, d) and the athlete's physiological efficiency.
+   *
+   * Calibrated values from the whitepaper:
+   * - Athlete A (68 kg): mf = 0.210
+   * - Athlete B (77 kg): mf = 0.198
+   *
+   * When not provided, a default estimate is derived by linear interpolation
+   * from the two calibrated data points above. This estimate is approximate;
+   * for best accuracy, calibrate mf against known VO2Max values.
+   *
+   * Only used by the cycling fallback path (when maxMet is unavailable).
+   */
+  massFactor?: number;
 }
 
 // ── Activity data ──────────────────────────────────────────────────────

@@ -28,6 +28,7 @@ const estimator = new VO2MaxEstimator({
   maxHr: 176,       // Firstbeat's internal HRmax estimate (bpm)
   restingHr: 42,    // Resting heart rate (bpm)
   weightKg: 68,     // Body weight (kg, used for cycling power normalization)
+  massFactor: 0.21, // Optional: per-athlete calibrated mass factor (cycling fallback)
 });
 
 // 2. Process activities in chronological order
@@ -64,7 +65,7 @@ VO2Max = round(maxMet * 3.5)
 
 No temporal smoothing is applied -- each activity produces an independent estimate.
 
-When `maxMet` is unavailable, a power-based fallback uses average power and heart rate with a dynamic-alpha EWMA.
+When `maxMet` is unavailable, a power-based fallback uses average power and heart rate with a per-athlete calibrated mass factor and a dynamic-alpha EWMA. The mass factor converts raw watts into a metabolic intensity proxy; if not provided, a default is estimated by linear interpolation from the two calibrated data points in the whitepaper. For best accuracy, calibrate `massFactor` per athlete against known VO2Max values.
 
 ### Running
 
@@ -114,9 +115,11 @@ const estimator = new VO2MaxEstimator(profile, state?);
 
 ```typescript
 interface AthleteProfile {
-  maxHr: number;      // Maximum heart rate (bpm) - Firstbeat's internal estimate
-  restingHr: number;  // Resting heart rate (bpm)
-  weightKg: number;   // Body weight (kg)
+  maxHr: number;       // Maximum heart rate (bpm) - Firstbeat's internal estimate
+  restingHr: number;   // Resting heart rate (bpm)
+  weightKg: number;    // Body weight (kg)
+  massFactor?: number; // Per-athlete calibrated mass factor for cycling fallback.
+                       // If omitted, estimated from weight via linear interpolation.
 }
 ```
 
@@ -198,7 +201,8 @@ import {
   // Cycling pipeline
   estimateCyclingVo2Max,
   percentHrr,
-  massFactor,
+  getMassFactor,
+  clampMet,
 
   // Constants
   CONSTANTS,

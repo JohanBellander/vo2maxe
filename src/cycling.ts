@@ -4,6 +4,10 @@
  * Implements whitepaper Section 4:
  * - Primary path: direct maxMet passthrough (Eq. 2)
  * - Fallback path: power-based estimation with %HRR model (Eqs. 3-7)
+ *
+ * The mass factor (mf) is a per-athlete calibrated constant (whitepaper rev2).
+ * When not provided, a default is estimated by linear interpolation from
+ * the two calibrated data points in the whitepaper.
  */
 
 import { CONSTANTS } from "./constants.js";
@@ -22,11 +26,38 @@ export function percentHrr(
 }
 
 /**
- * Compute the per-athlete mass factor for cycling power normalization.
- * Eq. 3: mf ≈ -0.034 × weight_kg + 4.85
+ * Get the per-athlete mass factor.
+ *
+ * If the athlete profile includes an explicit massFactor, it is used directly.
+ * Otherwise, a default estimate is derived by linear interpolation from the
+ * two calibrated data points in the whitepaper:
+ *   Athlete A (68 kg) → mf = 0.210
+ *   Athlete B (77 kg) → mf = 0.198
+ *
+ * The default is approximate; for best accuracy, calibrate mf per athlete
+ * against known VO2Max values.
  */
-export function massFactor(weightKg: number): number {
-  return CONSTANTS.MASS_FACTOR_WEIGHT_COEFF * weightKg + CONSTANTS.MASS_FACTOR_CONSTANT;
+export function getMassFactor(profile: AthleteProfile): number {
+  if (profile.massFactor != null) {
+    return profile.massFactor;
+  }
+  return (
+    CONSTANTS.DEFAULT_MF_WEIGHT_SLOPE * profile.weightKg +
+    CONSTANTS.DEFAULT_MF_INTERCEPT
+  );
+}
+
+/**
+ * Clamp raw MET to a physiologically valid range.
+ *
+ * Vigorous cycling typically produces 5-18 MET. Values outside 1-30 MET
+ * are physically impossible and indicate a formula or input error.
+ */
+export function clampMet(rawMet: number): number {
+  return Math.max(
+    CONSTANTS.CYCLING_MET_CLAMP_MIN,
+    Math.min(CONSTANTS.CYCLING_MET_CLAMP_MAX, rawMet),
+  );
 }
 
 /**
@@ -41,7 +72,10 @@ export function rawMetWindowed(
   hrRest: number,
 ): number {
   const pctHrr = percentHrr(windowHr, hrMax, hrRest);
-  return CONSTANTS.CYCLING_WINDOWED_K * ((windowPower * mf) / pctHrr) + CONSTANTS.CYCLING_WINDOWED_D;
+  const raw =
+    CONSTANTS.CYCLING_WINDOWED_K * ((windowPower * mf) / pctHrr) +
+    CONSTANTS.CYCLING_WINDOWED_D;
+  return clampMet(raw);
 }
 
 /**
@@ -56,7 +90,10 @@ export function rawMetSummary(
   hrRest: number,
 ): number {
   const pctHrr = percentHrr(avgHr, hrMax, hrRest);
-  return CONSTANTS.CYCLING_SUMMARY_K * ((avgPower * mf) / pctHrr) + CONSTANTS.CYCLING_SUMMARY_D;
+  const raw =
+    CONSTANTS.CYCLING_SUMMARY_K * ((avgPower * mf) / pctHrr) +
+    CONSTANTS.CYCLING_SUMMARY_D;
+  return clampMet(raw);
 }
 
 /**
@@ -78,7 +115,7 @@ export function cyclingDynamicAlpha(n: number): number {
  * Returns null if no estimate can be produced.
  *
  * @param activity - The cycling activity data
- * @param profile - The athlete profile
+ * @param profile - The athlete profile (including optional massFactor)
  * @param fallbackState - Mutable state for the cycling fallback EWMA.
  *   Pass `{ ewma: number | null; count: number }` to maintain state across
  *   activities. Only used when maxMet is unavailable.
@@ -102,7 +139,7 @@ export function estimateCyclingVo2Max(
     return null;
   }
 
-  const mf = massFactor(profile.weightKg);
+  const mf = getMassFactor(profile);
   let rawMet: number;
 
   if (activity.windowedData) {

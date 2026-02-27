@@ -75,10 +75,26 @@ export const CONSTANTS = {
   CYCLING_SUMMARY_K: 0.2982,
   /** Summary model intercept d (Eq. 7) */
   CYCLING_SUMMARY_D: 0.819,
-  /** Mass factor weight coefficient (Eq. 3) */
-  MASS_FACTOR_WEIGHT_COEFF: -0.034,
-  /** Mass factor constant (Eq. 3) */
-  MASS_FACTOR_CONSTANT: 4.85,
+  /**
+   * Default mass factor interpolation coefficients.
+   *
+   * The mass factor is per-athlete calibrated (whitepaper rev2, Eq. 3).
+   * When not provided, we estimate from the two calibrated data points:
+   *   Athlete A (68 kg) → mf = 0.210
+   *   Athlete B (77 kg) → mf = 0.198
+   *
+   * Linear interpolation: mf ≈ slope × weight + intercept
+   *   slope = (0.198 - 0.210) / (77 - 68) = -0.001333...
+   *   intercept = 0.210 - (-0.001333... × 68) = 0.3007
+   *
+   * This default is approximate; for best results, calibrate mf per athlete.
+   */
+  DEFAULT_MF_WEIGHT_SLOPE: -0.012 / 9, // ≈ -0.001333
+  DEFAULT_MF_INTERCEPT: 0.210 + (0.012 / 9) * 68, // ≈ 0.3007
+  /** Minimum physiologically valid raw MET for cycling (safety clamp). */
+  CYCLING_MET_CLAMP_MIN: 1.0,
+  /** Maximum physiologically valid raw MET for cycling (safety clamp). */
+  CYCLING_MET_CLAMP_MAX: 30.0,
   /** Dynamic alpha start for cycling fallback EWMA (Eq. 8) */
   CYCLING_ALPHA_START: 0.5,
   /** Dynamic alpha end for cycling fallback EWMA */
